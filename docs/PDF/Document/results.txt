@@ -1,0 +1,12 @@
+Raw rows: 7,043  after cleaning: 7,043  churn rate: 26.5%
+
+Logistic Regression  acc=0.740 recall=0.786 roc_auc=0.841
+Random Forest        acc=0.775 recall=0.652 roc_auc=0.828
+Gradient Boosting    acc=0.798 recall=0.508 roc_auc=0.842
+
+Best model: Logistic Regression  acc=74.0% recall=78.6% roc_auc=0.84
+Top 3 churn drivers: TotalCharges, tenure, MonthlyCharges
+
+===== RESUME BULLETS =====
+- Predicted customer churn with 0.84 ROC-AUC, 74% accuracy and 79% recall on a held-out test set of 1,409 customers, after cleaning the data, handling class imbalance and comparing Logistic Regression, Random Forest, Gradient Boosting.
+- Identified TotalCharges, tenure, MonthlyCharges as the top churn drivers (Random Forest feature importance) against an overall churn rate of 26.5%, to inform targeted retention.
