@@ -1,5 +1,8 @@
 """Customer churn prediction on the IBM Telco Customer Churn dataset.
 
+Model selection uses 5-fold cross-validation on the training split only.
+The held-out test set is scored once, for the selected model.
+
 Usage:
     python churn_prediction.py --data data/WA_Fn-UseC_-Telco-Customer-Churn.csv --outdir docs
 """
@@ -9,22 +12,25 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, recall_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from plots import save_figures, save_console_image
+from plots import save_console_image, save_figures
 
 DEFAULT_DATA = Path("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
 DEFAULT_OUTDIR = Path("docs")
 REQUIRED_COLUMNS = {"tenure", "TotalCharges", "Churn"}
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
-# Models within this ROC-AUC of the best are treated as tied; the tie is broken by recall,
+CV_FOLDS = 5
+TOP_SHARE = 0.2  # share of customers on the retention list
+# Models within this CV ROC-AUC of the best are treated as tied; recall breaks the tie,
 # because missing a churning customer is the costlier error.
 AUC_TIE_TOLERANCE = 0.005
 
@@ -75,25 +81,24 @@ def build_models() -> dict:
     }
 
 
-def evaluate(models: dict, X_tr, X_te, y_tr, y_te) -> dict[str, dict[str, float]]:
-    """Fit each model and score it on the held-out test set."""
+def cross_validate_models(X: pd.DataFrame, y: pd.Series) -> dict[str, dict[str, float]]:
+    """Mean and std of ROC-AUC and recall across folds, computed on training data only."""
+    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     results = {}
-    for name, model in models.items():
-        model.fit(X_tr, y_tr)
-        pred = model.predict(X_te)
-        proba = model.predict_proba(X_te)[:, 1]
+    for name, model in build_models().items():
+        scores = cross_validate(model, X, y, cv=cv, scoring=["roc_auc", "recall"])
         results[name] = {
-            "accuracy": accuracy_score(y_te, pred),
-            "recall": recall_score(y_te, pred),
-            "roc_auc": roc_auc_score(y_te, proba),
+            "roc_auc": scores["test_roc_auc"].mean(),
+            "roc_auc_std": scores["test_roc_auc"].std(),
+            "recall": scores["test_recall"].mean(),
         }
     return results
 
 
-def pick_best(results: dict[str, dict[str, float]]) -> str:
-    top_auc = max(r["roc_auc"] for r in results.values())
-    contenders = [n for n, r in results.items() if r["roc_auc"] >= top_auc - AUC_TIE_TOLERANCE]
-    return max(contenders, key=lambda n: results[n]["recall"])
+def pick_best(cv_results: dict[str, dict[str, float]]) -> str:
+    top_auc = max(r["roc_auc"] for r in cv_results.values())
+    contenders = [n for n, r in cv_results.items() if r["roc_auc"] >= top_auc - AUC_TIE_TOLERANCE]
+    return max(contenders, key=lambda n: cv_results[n]["recall"])
 
 
 def original_feature(encoded: str, base_cols: list[str]) -> str:
@@ -111,29 +116,60 @@ def top_drivers(rf_model, X_columns, base_cols: list[str]) -> pd.Series:
     return grouped.sort_values(ascending=False)
 
 
+def retention_list_impact(y_true: np.ndarray, proba: np.ndarray) -> dict:
+    """How many churners the top-risk list captures, scored on the test set."""
+    k = int(round(TOP_SHARE * len(proba)))
+    order = np.argsort(-proba)
+    top = y_true[order[:k]]
+    return {
+        "list_size": k,
+        "churners_on_list": int(top.sum()),
+        "churners_total": int(y_true.sum()),
+        "capture": top.sum() / y_true.sum(),
+        "precision": top.mean(),
+    }
+
+
 def run(path: Path) -> dict:
     df, n_raw = load_and_clean(path)
     base_cols = [c for c in df.columns if c != "Churn"]
     X, y = build_features(df)
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
+    X_trval, X_te, y_trval, y_te = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
-    models = build_models()
-    results = evaluate(models, X_tr, X_te, y_tr, y_te)
-    best = pick_best(results)
-    drivers = top_drivers(models["Random Forest"], X.columns, base_cols)
+
+    # 1. choose the model using training data only
+    cv_results = cross_validate_models(X_trval, y_trval)
+    best = pick_best(cv_results)
+
+    # 2. fit the winner on training data and score the test set once
+    final = build_models()[best].fit(X_trval, y_trval)
+    pred = final.predict(X_te)
+    proba = final.predict_proba(X_te)[:, 1]
+    test = {
+        "accuracy": accuracy_score(y_te, pred),
+        "recall": recall_score(y_te, pred),
+        "roc_auc": roc_auc_score(y_te, proba),
+    }
+
+    # 3. feature drivers from a Random Forest fitted on the same training data
+    rf = build_models()["Random Forest"].fit(X_trval, y_trval)
+    drivers = top_drivers(rf, X.columns, base_cols)
 
     return {
         "df": df,
         "n_raw": n_raw,
         "n_clean": len(df),
+        "n_train": len(y_trval),
         "n_test": len(y_te),
         "churn_rate": y.mean() * 100,
-        "results": results,
+        "cv": cv_results,
         "best": best,
-        "best_pred": models[best].predict(X_te),
+        "test": test,
+        "best_pred": pred,
         "y_test": y_te.to_numpy(),
+        "impact": retention_list_impact(y_te.to_numpy(), proba),
         "drivers": drivers,
         "top_drivers": list(drivers.index[:3]),
     }
@@ -143,28 +179,34 @@ def format_report(s: dict) -> str:
     lines = [
         f"Raw rows: {s['n_raw']:,}  after cleaning: {s['n_clean']:,}  "
         f"churn rate: {s['churn_rate']:.1f}%",
+        f"Train: {s['n_train']:,}  test: {s['n_test']:,}",
         "",
+        f"Model selection ({CV_FOLDS}-fold CV on training data):",
     ]
-    for name, r in s["results"].items():
+    for name, r in s["cv"].items():
         lines.append(
-            f"{name:20s} acc={r['accuracy']:.3f} recall={r['recall']:.3f} roc_auc={r['roc_auc']:.3f}"
+            f"  {name:20s} roc_auc={r['roc_auc']:.3f} (+/-{r['roc_auc_std']:.3f})  recall={r['recall']:.3f}"
         )
-    b = s["results"][s["best"]]
+    t = s["test"]
     lines += [
         "",
-        f"Best model: {s['best']}  acc={b['accuracy']:.1%} recall={b['recall']:.1%} "
-        f"roc_auc={b['roc_auc']:.2f}",
+        f"Selected: {s['best']}",
+        f"Test set (scored once): acc={t['accuracy']:.1%} recall={t['recall']:.1%} roc_auc={t['roc_auc']:.2f}",
+        "",
+        f"Retention list (top {TOP_SHARE:.0%} by risk, test set): {s['impact']['list_size']} customers, "
+        f"{s['impact']['churners_on_list']} churners "
+        f"({s['impact']['capture']:.1%} of all churners, {s['impact']['precision']:.1%} precision)",
         f"Top 3 churn drivers: {', '.join(s['top_drivers'])}",
     ]
     return "\n".join(lines)
 
 
 def resume_bullets(s: dict) -> list[str]:
-    b = s["results"][s["best"]]
+    t = s["test"]
     return [
-        f"Predicted customer churn with {b['roc_auc']:.2f} ROC-AUC, {b['accuracy']:.0%} accuracy "
-        f"and {b['recall']:.0%} recall on a held-out test set of {s['n_test']:,} customers, after "
-        f"cleaning the data, handling class imbalance and comparing {', '.join(s['results'])}.",
+        f"Predicted customer churn with {t['roc_auc']:.2f} ROC-AUC, {t['accuracy']:.0%} accuracy and "
+        f"{t['recall']:.0%} recall on a held-out test set of {s['n_test']:,} customers, selecting the model "
+        f"with 5-fold cross-validation and handling class imbalance across {', '.join(s['cv'])}.",
         f"Identified {', '.join(s['top_drivers'])} as the top churn drivers (Random Forest feature "
         f"importance) against an overall churn rate of {s['churn_rate']:.1f}%, to inform targeted retention.",
     ]

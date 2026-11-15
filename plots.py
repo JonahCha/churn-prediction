@@ -56,19 +56,19 @@ def _churn_by_contract(s: dict, path: Path) -> Path:
 
 
 def _model_comparison(s: dict, path: Path) -> Path:
-    names = list(s["results"])
-    metrics = ["accuracy", "recall", "roc_auc"]
-    width = 0.25
+    names = list(s["cv"])
+    metrics = [("roc_auc", "ROC-AUC"), ("recall", "Recall")]
+    width = 0.35
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for i, m in enumerate(metrics):
-        vals = [s["results"][n][m] for n in names]
-        bars = ax.bar([x + (i - 1) * width for x in range(len(names))], vals, width,
-                      label=m.replace("_", " ").upper(), color=PALETTE[i])
+    for i, (key, label) in enumerate(metrics):
+        vals = [s["cv"][n][key] for n in names]
+        xs = [x + (i - 0.5) * width for x in range(len(names))]
+        bars = ax.bar(xs, vals, width, label=label, color=PALETTE[i])
         ax.bar_label(bars, labels=[f"{v:.2f}" for v in vals], fontsize=8)
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names)
     ax.set_ylim(0, 1.05)
-    ax.set_title("Model comparison on held-out test set")
+    ax.set_title("Model comparison (5-fold CV on training data)")
     ax.legend()
     return _finish(fig, path)
 

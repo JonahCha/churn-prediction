@@ -6,6 +6,8 @@ from churn_prediction import (
     build_features,
     load_and_clean,
     original_feature,
+    pick_best,
+    retention_list_impact,
     run,
 )
 
@@ -64,13 +66,33 @@ def test_original_feature_maps_dummies_back():
     assert original_feature("tenure", base) == "tenure"
 
 
-def test_end_to_end_metrics_are_sane(tmp_path):
+def test_pick_best_uses_recall_to_break_auc_tie():
+    cv = {
+        "A": {"roc_auc": 0.840, "recall": 0.60},
+        "B": {"roc_auc": 0.842, "recall": 0.80},
+        "C": {"roc_auc": 0.700, "recall": 0.99},
+    }
+    assert pick_best(cv) == "B"
+
+
+def test_retention_list_impact_counts():
+    y = np.array([1, 0, 1, 0, 0, 0, 1, 0, 0, 0])
+    proba = np.array([0.9, 0.1, 0.8, 0.2, 0.1, 0.3, 0.4, 0.05, 0.2, 0.15])
+    impact = retention_list_impact(y, proba)
+    assert impact["list_size"] == 2
+    assert impact["churners_on_list"] == 2
+    assert impact["churners_total"] == 3
+
+
+def test_end_to_end_is_sane(tmp_path):
     path = make_telco_csv(tmp_path / "telco.csv")
     s = run(path)
-    assert s["best"] in s["results"]
-    for r in s["results"].values():
-        assert 0.0 <= r["accuracy"] <= 1.0
-        assert 0.0 <= r["recall"] <= 1.0
-        assert 0.5 <= r["roc_auc"] <= 1.0
+    assert s["best"] in s["cv"]
     assert s["n_test"] == 60  # 20% of 300
+    assert s["n_train"] == 240
+    for r in s["cv"].values():
+        assert 0.5 <= r["roc_auc"] <= 1.0
+    t = s["test"]
+    assert 0.0 <= t["accuracy"] <= 1.0
+    assert 0.5 <= t["roc_auc"] <= 1.0
     assert "Contract" in s["top_drivers"]
